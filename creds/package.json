@@ -1,0 +1,7 @@
+{
+  "name": "@fcli/uck-creds",
+  "version": "0.1.0",
+  "description": "f uck: store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
+  "type": "module",
+  "main": "index.js"
+}
