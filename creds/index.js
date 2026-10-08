@@ -172,6 +172,48 @@ function fmt(ms) {
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
 }
 
+/**
+ * Wait for a cred to be available, blocking up to `timeout` ms.
+ *
+ * Polls every `pollMs` (default 500ms). Each tick:
+ *   - if the daemon is locked (not running), keep waiting — the user needs to
+ *     run `f creds unlock` in another terminal first;
+ *   - if unlocked, check whether the cred is set; if so, fetch and return it.
+ * Resolves to the cred's value the moment both conditions are met. Rejects with
+ * a clear error if `timeout` elapses. This is the mechanism that lets an LLM
+ * uck ask for a credential and block while the user supplies it elsewhere.
+ */
+async function wait(name, { timeout = 300000, pollMs = 500, onPoll } = {}) {
+  const deadline = Date.now() + timeout;
+  // Helper: does the cred exist right now (daemon must be up)?
+  async function tryGet() {
+    const state = unlockedState();
+    if (!state) return null; // locked
+    const r = await daemonCall({ op: "get", name }, state.socket);
+    if (r && r.ok && r.value != null && r.value !== "") return r.value;
+    return null;
+  }
+  // Immediate check first (no delay if already present).
+  let v;
+  try { v = await tryGet(); } catch { v = null; }
+  if (v != null) return v;
+
+  while (Date.now() < deadline) {
+    const remainMs = deadline - Date.now();
+    const sleepMs = Math.min(pollMs, remainMs);
+    if (onPoll) {
+      try { onPoll(remainMs); } catch {}
+    }
+    await new Promise((r) => setTimeout(r, sleepMs));
+    try { v = await tryGet(); } catch { v = null; }
+    if (v != null) return v;
+  }
+  throw new Error(
+    `timed out after ${fmt(timeout)} waiting for cred '${name}' — ` +
+    `run in another terminal: f creds unlock && f creds set ${name} <value>`
+  );
+}
+
 export function register(ctx) {
   return {
     name: "creds",
@@ -196,6 +238,15 @@ export function register(ctx) {
         const r = await daemonCall({ op: "ls" }, state.socket);
         return r.names ?? [];
       },
+      /**
+       * Wait for a cred, blocking up to timeout (default 5 min). Resolves to the
+       * value the moment it's set (and the daemon is unlocked). Rejects on
+       * timeout. opts: { timeout (ms), pollMs, onPoll(remainMs) }.
+       * Usage from a uck: const token = await credsApi.wait("forgejo.kensand.net", { timeout: 300000 });
+       */
+      wait(name, opts) {
+        return wait(name, opts);
+      },
       unlock,
       lock,
       status: () => {
@@ -206,10 +257,14 @@ export function register(ctx) {
     run: (argv, args) => {
       const pos = [];
       let ttl = DEFAULT_TTL;
+      let timeoutSec = 300; // default wait window for `request`
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
           ttl = Number(a[i + 1]);
+          i++;
+        } else if (a[i] === "--timeout") {
+          timeoutSec = Number(a[i + 1]);
           i++;
         } else pos.push(a[i]);
       }
@@ -237,6 +292,15 @@ export function register(ctx) {
           case "get": {
             const r = await op("get", { name: rest[0] });
             if (r.value != null) process.stdout.write(r.value + "\n");
+            break;
+          }
+          case "request": {
+            const name = rest[0];
+            if (!name) return usage("request requires <name>");
+            const timeoutMs = timeoutSec * 1000;
+            process.stderr.write(`f: waiting for cred '${name}' up to ${fmt(timeoutMs)}… (set it in another terminal: f creds set ${name} <value>)\n`);
+            const value = await wait(name, { timeout: timeoutMs });
+            process.stdout.write(value + "\n");
             break;
           }
           case "ls": {
@@ -281,6 +345,9 @@ function usage(msg) {
       "  status                          locked / unlocked + time left\n" +
       "  set <name> <value>              store a cred\n" +
       "  get <name>                      print a cred\n" +
+      "  request <name> [--timeout sec]  block until the cred is set elsewhere,\n" +
+      "                                    then print it (default 300s; also waits\n" +
+      "                                    for unlock if the daemon is locked)\n" +
       "  ls                              list names\n" +
       "  rm <name>                       remove a cred\n"
   );
