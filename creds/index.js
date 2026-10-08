@@ -370,6 +370,7 @@ export function register(ctx) {
       const pos = [];
       let ttl = DEFAULT_TTL;
       let timeoutSec = 300; // default wait window for `request`
+      let showSecrets = false;
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
@@ -378,8 +379,12 @@ export function register(ctx) {
         } else if (a[i] === "--timeout") {
           timeoutSec = Number(a[i + 1]);
           i++;
+        } else if (a[i] === "--secrets") {
+          showSecrets = true;
         } else pos.push(a[i]);
       }
+      const redact = (value) =>
+        showSecrets ? String(value) : `[redacted — pass --secrets to reveal]`;
       const [cmd, ...rest] = pos;
 
       (async () => {
@@ -403,7 +408,7 @@ export function register(ctx) {
           }
           case "get": {
             const r = await op("get", { name: rest[0] });
-            if (r.value != null) process.stdout.write(r.value + "\n");
+            if (r.value != null) process.stdout.write(redact(r.value) + "\n");
             break;
           }
           case "request": {
@@ -412,7 +417,8 @@ export function register(ctx) {
             const timeoutMs = timeoutSec * 1000;
             process.stderr.write(`f: waiting for cred '${name}' up to ${fmt(timeoutMs)}… (set it in another terminal: f creds set ${name} <value>)\n`);
             const value = await wait(name, { timeout: timeoutMs, by: "f creds request" });
-            process.stdout.write(value + "\n");
+            if (showSecrets) process.stdout.write(value + "\n");
+            else process.stderr.write(`f: cred '${name}' available (pass --secrets to print)\n`);
             break;
           }
           case "waiters": {
@@ -497,10 +503,11 @@ function usage(msg) {
       "  lock                            stop daemon, zeroize key\n" +
       "  status                          locked / unlocked + time left\n" +
       "  set <name> <value>              store a cred\n" +
-      "  get <name>                      print a cred\n" +
+      "  get <name> [--secrets]          print a cred (redacted without --secrets)\n" +
       "  request <name> [--timeout sec]  block until the cred is set elsewhere,\n" +
       "                                    then print it (default 300s; also waits\n" +
-      "                                    for unlock if the daemon is locked)\n" +
+      "                                    for unlock if the daemon is locked;\n" +
+      "                                    add --secrets to print, else confirm only)\n" +
       "  waiters                         list open waiting requests (from other\n" +
       "                                    terminals' f fj / ucks that are blocked)\n" +
       "  fill [name]                     prompt + set value(s) for the open\n" +
