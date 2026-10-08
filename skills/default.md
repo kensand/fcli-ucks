@@ -27,6 +27,83 @@ instructions you can pull into context on demand. Skills live in
 - Add `-g` to any of these to target the global `~/.f/f.config.json` instead
   of the project `f.config.json`.
 
+## Creating a new uck
+
+A **uck** is a directory with an `index.js` that exports `register(ctx)`. It's
+only a word when prefixed with `f-`. Create one anywhere, then point a source
+at it (or put it in a personal uck repo).
+
+```
+myuck/
+  index.js
+```
+
+```js
+// myuck/index.js
+export function register(_ctx) {
+  return {
+    name: "myuck",                 // -> `f myuck`
+    desc: "terse description",     // shown in f help
+    run: (_argv, args) => {
+      // args._ is the remaining CLI args (already stripped of the uck name)
+      console.log("hello", args._.join(" "));
+    },
+    // argv?: (argv) => args        // optional custom arg parser
+  };
+}
+export default { register };
+```
+
+`register(ctx)` runs once at load (`ctx` = `{ fVersion, ucks: [{name, desc}], self }`);
+`run()` runs per invocation. Return one uck object, or an array to register
+several from one module. Full Node runtime — no sandbox: import other ucks,
+use `child_process`, `fs`, `http`, hit the network, whatever. A uck that
+needs a third-party lib puts it in its own `package.json` (f runs `npm i` in
+the uck dir on install / `f up`) — never in f core.
+
+To try a uck locally without a repo: `f config add ucks ./myuck` (or add it to
+`f.config.json`), then `f up` — it installs to `~/.f/ucks/<bucket>/myuck/` and
+becomes `f myuck`.
+
+## Personal uck repos
+
+Your own ucks live in a personal uck repo (a git repo of `<name>/index.js`
+dirs), wired two ways in `~/.f`:
+
+- **Pull** — a source in `~/.f/f.config.json`:
+  `{ "source": "<git-url>", "name": "kensand-fcli-ucks" }`. `f up` downloads
+  its ucks into `~/.f/ucks/kensand-fcli-ucks/`. The `name` is the **bucket**
+  (provenance); a same-named uck here shadows the defaults (personal wins).
+- **Push** — a target in `~/.f/f.repo.json` (managed by the `uck` uck):
+  `f uck repo add kensand-fcli-ucks <git-url> --ref main`. The target name
+  must match the bucket, so `f uck push -r kensand-fcli-ucks` mirrors your
+  local `~/.f/ucks/kensand-fcli-ucks/` ucks back to the repo.
+
+Workflow: write ucks under `~/.f/ucks/kensand-fcli-ucks/<name>/`, then
+`f uck push -r kensand-fcli-ucks` to persist them, `f up` to pull on other
+machines.
+
+## When to make a uck (for LLMs)
+
+**If you find yourself repeating a sequence of tool calls, stop and make it a
+uck.** The first time you do something by hand (a command, a multi-step
+pipeline, a fetch-and-format, a project-specific check), wrap it as a uck so
+the next time it's one token: `f <name> [args]`.
+
+Rules of thumb:
+- **Repeated 2+ times** → uck it. The cost of a uck (a few lines of
+  `index.js`) pays back on the second invocation.
+- **Project-specific** → put it in the project's `f.config.json` / local
+  source. **Reusable across projects** → put it in your personal uck repo.
+- **Keep it terse**: short name, minimal output, no boilerplate. The uck is
+  for *you* to call next time — design the `args` so the common case is
+  `f <name>` with no flags.
+- After creating one, `f up` (local) or `f uck push -r <bucket>` (repo) so it
+  sticks, and `f help` to confirm it's listed.
+
+Prefer a uck over re-deriving the steps: a uck is cheaper to call, easier to
+audit, and survives context resets.
+
 ## Finding other skills
 
 `f skills search <query>` ranks your configured skills by how relevant their
