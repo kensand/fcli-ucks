@@ -40,26 +40,41 @@ myuck/
 
 ```js
 // myuck/index.js
-export function register(_ctx) {
+export function register(ctx) {
+  // ctx = { fVersion, self } — load time, before any ucks exist.
   return {
     name: "myuck",                 // -> `f myuck`
     desc: "terse description",     // shown in f help
-    run: (_argv, args) => {
+    run: (argv, args, ctx) => {
       // args._ is the remaining CLI args (already stripped of the uck name)
+      // ctx = { fVersion, self, ucks: [{name,desc}], registry }
       console.log("hello", args._.join(" "));
     },
     // argv?: (argv) => args        // optional custom arg parser
+    // ...any other field you want. Core ignores unknown fields.
   };
 }
 export default { register };
 ```
 
-`register(ctx)` runs once at load (`ctx` = `{ fVersion, ucks: [{name, desc}], self }`);
-`run()` runs per invocation. Return one uck object, or an array to register
-several from one module. Full Node runtime — no sandbox: import other ucks,
-use `child_process`, `fs`, `http`, hit the network, whatever. A uck that
-needs a third-party lib puts it in its own `package.json` (f runs `npm i` in
-the uck dir on install / `f up`) — never in f core.
+Two phases:
+- `register(ctx)` runs **once at load**, `ctx = { fVersion, self }` — no other
+  ucks are available yet (they haven't loaded).
+- `run(argv, args, ctx)` runs **per invocation**, after every uck is loaded,
+  `ctx = { fVersion, self, ucks: [{name,desc}], registry }`.
+
+**`ctx.registry`** (run time) is the full map of every uck's exported object —
+name -> what that uck returned from `register()`. A uck can export anything,
+and any other uck can read it off `ctx.registry` at run time. That's how ucks
+interoperate: e.g. a uck that exports `skills: [...]` contributes skills that
+the `skills` uck merges in. Core imposes no restrictions on what a uck
+exports.
+
+Return one uck object, or an array to register several from one module. Full
+Node runtime — no sandbox: import other ucks, use `child_process`, `fs`,
+`http`, hit the network, whatever. A uck that needs a third-party lib puts it
+in its own `package.json` (f runs `npm i` in the uck dir on install / `f up`)
+— never in f core.
 
 To try a uck locally without a repo: `f config add ucks ./myuck` (or add it to
 `f.config.json`), then `f up` — it installs to `~/.f/ucks/<bucket>/myuck/` and
