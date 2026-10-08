@@ -27,6 +27,15 @@ instructions you can pull into context on demand. Skills live in
 - Add `-g` to any of these to target the global `~/.f/f.config.json` instead
   of the project `f.config.json`.
 
+Skills come from two places, merged by name (a config entry **wins** over a
+same-named uck skill, so you can override what a uck contributes):
+1. **Config** — entries in the `skills` array (the ones `f skills add/rm`
+   manage). A `path` points to a local `.md` file.
+2. **Uck-exported** — any uck can export `skills: [...]` in its `register()`
+   return value. Each entry is `{ name, path? }` or `{ name, content }` (inline
+   markdown) or a bare name. These are read off `ctx.registry` at run time and
+   show up in `ls`/`show`/`search` automatically — no config entry needed.
+
 ## Creating a new uck
 
 A **uck** is a directory with an `index.js` that exports `register(ctx)`. It's

@@ -83,10 +83,12 @@ function ensureDefaultSkill() {
   } catch {}
 }
 
-/** Read a skill's content string, or null if absent/missing. */
+/** Read a skill's content string, or null if absent/missing.
+ *  Supports both `path` (file pointer) and inline `content` strings. */
 function readSkillContent(s) {
+  if (typeof s.content === "string") return s.content;
   const p = resolve(s.path);
-  if (!existsSync(p)) return null;
+  if (!p || !existsSync(p)) return null;
   try {
     return readFileSync(p, "utf8");
   } catch {
@@ -94,13 +96,41 @@ function readSkillContent(s) {
   }
 }
 
-/** Rank skills (name + content) by relevance to a query. Returns scored list. */
-function searchSkills(query) {
+/**
+ * Skills exported by registered ucks. A uck can export `skills: [...]` in its
+ * register() return value; each entry is { name, path? , content? } (or a bare
+ * name). Read off ctx.registry at run time (after all ucks are loaded).
+ * Returns a map name -> skill entry, preserving each uck's ordering.
+ */
+function uckExportedSkills(registry) {
+  const out = new Map();
+  if (!registry) return out;
+  for (const uck of Object.values(registry)) {
+    const skills = uck && Array.isArray(uck.skills) ? uck.skills : null;
+    if (!skills) continue;
+    for (const s of skills) {
+      const entry = typeof s === "string" ? { name: s } : s;
+      if (!entry || !entry.name) continue;
+      if (!out.has(entry.name)) out.set(entry.name, entry);
+    }
+  }
+  return out;
+}
+
+/** Rank skills (name + content) by relevance to a query. Returns scored list.
+ *  Merges config-file skills (global + project) with uck-exported skills;
+ *  config entries win over same-named uck skills. */
+function searchSkills(query, registry) {
   const q = String(query).toLowerCase().trim();
   if (!q) return [];
   const terms = q.split(/\s+/).filter(Boolean);
-  // Search both global and project skills (de-dup by name, project wins).
+  // Merge: config-file skills (global + project) + uck-exported skills.
+  // Config entries win over a same-named uck skill (explicit user intent).
   const doc = { skills: [] };
+  const uckSkills = uckExportedSkills(registry);
+  // Seed with uck-exported skills first (lowest precedence), then overlay
+  // config-file skills (project wins over global), which overwrite by name.
+  for (const s of uckSkills.values()) doc.skills.push(s);
   for (const target of ["global", "project"]) {
     const d = readDoc(resolveTarget(target));
     for (const s of skillsOf(d)) {
@@ -120,7 +150,7 @@ function searchSkills(query) {
       else if (name.includes(t)) score += 3;
       if (content.includes(t)) score += 1;
     }
-    if (score > 0) scored.push({ name: s.name, path: s.path, score });
+    if (score > 0) scored.push({ name: s.name, path: s.path ?? "(inline)", score });
   }
   scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
   return scored;
@@ -149,11 +179,13 @@ const skillsApi = {
     writeDoc(file, doc);
     return true;
   },
-  ls(target) {
-    // Project skills, then global skills not already listed — so the
-    // auto-seeded 'default' (a global skill) shows up even from a project.
+  ls(target, registry) {
+    // Project config skills, then global config skills, then uck-exported
+    // skills not already listed — so the auto-seeded 'default' (global)
+    // and any uck-contributed skills show up. Config wins over uck by name.
     const out = [];
     const seen = new Set();
+    const uckSkills = uckExportedSkills(registry);
     const targets = target === "global" ? ["global"] : ["project", "global"];
     for (const t of targets) {
       for (const s of skillsOf(readDoc(resolveTarget(t)))) {
@@ -162,10 +194,16 @@ const skillsApi = {
         out.push(s);
       }
     }
+    for (const s of uckSkills.values()) {
+      if (seen.has(s.name)) continue;
+      seen.add(s.name);
+      out.push(s);
+    }
     return out;
   },
-  /** Resolve a skill's content, or a status object. Project first, then global. */
-  show(target, name) {
+  /** Resolve a skill's content, or a status object. Project config, then
+   *  global config, then uck-exported. */
+  show(target, name, registry) {
     for (const t of [target, "global"]) {
       const s = findSkill(readDoc(resolveTarget(t)), name);
       if (s) {
@@ -174,10 +212,16 @@ const skillsApi = {
         return { name, path: s.path, content };
       }
     }
+    const s = uckExportedSkills(registry).get(name);
+    if (s) {
+      const content = readSkillContent(s);
+      if (content == null) return { name, path: s.path ?? "(inline)", missing: true };
+      return { name, path: s.path ?? "(inline)", content };
+    }
     return null;
   },
-  search(query) {
-    return searchSkills(query);
+  search(query, registry) {
+    return searchSkills(query, registry);
   },
 };
 
@@ -209,16 +253,17 @@ export function register(ctx) {
     name: "skills",
     desc: "manage local skill entries (search/ls/show/add/rm) in f.config.json",
     skillsApi,
-    run: (argv, args) => {
+    run: (argv, args, ctx) => {
       const flags = [];
       const pos = [];
       for (const a of args._ ?? []) (a === "-g" ? flags : pos).push(a);
       const target = flags.includes("-g") ? "global" : "project";
       const [op, a, b] = pos;
+      const registry = ctx && ctx.registry;
 
       // Bare `f skills` → show the default skill.
       if (!op) {
-        const r = skillsApi.show("global", "default");
+        const r = skillsApi.show("global", "default", registry);
         if (r && !r.missing) return process.stdout.write(r.content);
         return usage();
       }
@@ -226,21 +271,22 @@ export function register(ctx) {
       switch (op) {
         case "search": {
           if (!a) return usage("search requires <query>");
-          const results = skillsApi.search(a);
+          const results = skillsApi.search(a, registry);
           if (results.length === 0) return process.stdout.write("");
           for (const r of results)
             process.stdout.write(`${r.score}\t${r.name}\t${r.path}\n`);
           break;
         }
         case "ls": {
-          const list = skillsApi.ls(target);
+          const list = skillsApi.ls(target, registry);
           if (list.length === 0) return process.stdout.write("");
-          for (const s of list) process.stdout.write(`${s.name}\t${s.path}\n`);
+          for (const s of list)
+            process.stdout.write(`${s.name}\t${s.path ?? "(inline)"}\n`);
           break;
         }
         case "show": {
           if (!a) return usage("show requires <name>");
-          const r = skillsApi.show(target, a);
+          const r = skillsApi.show(target, a, registry);
           if (r == null) {
             process.stderr.write(`f: no skill '${a}'\n`);
             process.exit(1);
