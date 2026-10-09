@@ -252,6 +252,12 @@ export function register(ctx) {
   return {
     name: "skills",
     desc: "manage local skill entries (search/ls/show/add/rm) in f.config.json",
+    // Core f docs, shipped in this uck and self-registered (no config entry
+    // needed). A config entry of the same name still wins (override).
+    // (f-creds lives with the creds uck; f-uck-creation with the uck uck.)
+    skills: [
+      { name: "f-cli", path: join(here, "f-cli.md") },
+    ],
     skillsApi,
     run: (argv, args, ctx) => {
       const flags = [];

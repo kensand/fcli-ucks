@@ -320,6 +320,7 @@ export function register(ctx) {
   return {
     name: "creds",
     desc: "store credentials (scrypt+AES-GCM, daemon+socket, ttl)",
+    skills: [{ name: "f-creds", path: path.join(__dirname, "SKILL.md") }],
     // Programmatic entry for other ucks.
     credsApi: {
       async get(name, ttl) {

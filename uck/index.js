@@ -19,7 +19,10 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const F = path.join(process.env.HOME ?? "", ".f");
 const REPO_FILE = path.join(F, "f.repo.json");
@@ -268,6 +271,7 @@ export function register(ctx) {
   return {
     name: "uck",
     desc: "push store ucks to a git repo (bucket name = target name)",
+    skills: [{ name: "f-uck-creation", path: path.join(__dirname, "SKILL.md") }],
     uckApi: { loadTargets, saveTargets, push, bucketUcks },
     run: (argv, args) => {
       const a = [...(args._ ?? [])];
