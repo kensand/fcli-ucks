@@ -476,6 +476,27 @@ async function filesLs({ json } = {}) {
   process.stdout.write(`ok\t${keys.length} file(s)\n`);
 }
 
+/**
+ * Parse a duration into whole seconds. Accepts a bare number (seconds),
+ * unit suffixes (s/m/h/d/w), or combined parts: "90", "45s", "10m", "1h30m",
+ * "2h", "1d", "1d6h30m", "2w". Units: s/m(=min)/h/d/w. No clamp — the caller
+ * gets what it asks for (note Node's setTimeout caps out near ~24.8 days).
+ */
+function parseDurationSec(v, label = "duration") {
+  const str = String(v).trim();
+  if (str === "") throw new Error(`${label} is empty`);
+  if (/^\d+$/.test(str)) return parseInt(str, 10); // bare seconds
+  const units = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 };
+  let total = 0, matched = 0;
+  const re = /(\d+)\s*([smhdw])/g;
+  let m;
+  while ((m = re.exec(str))) { total += parseInt(m[1], 10) * units[m[2]]; matched += m[0].length; }
+  if (matched === 0 || matched !== str.replace(/\s+/g, "").length) {
+    throw new Error(`invalid ${label} '${v}' (use e.g. 5m, 2h, 1d, 2w, 1d6h30m, or plain seconds)`);
+  }
+  return total;
+}
+
 function fmt(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -620,11 +641,9 @@ export function register(ctx) {
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
-          ttl = Number(a[i + 1]);
-          i++;
+          ttl = parseDurationSec(a[++i], "--ttl");
         } else if (a[i] === "--timeout") {
-          timeoutSec = Number(a[i + 1]);
-          i++;
+          timeoutSec = parseDurationSec(a[++i], "--timeout");
         } else if (a[i] === "--secrets") {
           showSecrets = true;
         } else if (a[i] === "--force") {
@@ -788,7 +807,8 @@ function usage(msg) {
   process.stderr.write(
     line +
       "usage: f creds <cmd>\n" +
-      "  unlock [passkey] [--ttl sec]   start daemon (default ttl 600s)\n" +
+      "  unlock [passkey] [--ttl sec]   start daemon; --ttl accepts s/m/h/d/w\n" +
+      "                                    (e.g. 900, 45m, 2h, 1d, 1d6h30m; default 10m)\n" +
       "  lock                            stop daemon, zeroize key\n" +
       "  status                          locked / unlocked + time left\n" +
       "  set <name> <value>              store a cred\n" +

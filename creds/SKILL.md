@@ -10,7 +10,8 @@ Encrypted credential store (scrypt+AES-GCM). A local daemon holds the key in mem
 ## Commands
 
 ```
-f creds unlock [passkey] [--ttl sec]   start daemon (default ttl 600s)
+f creds unlock [passkey] [--ttl d]      start daemon; --ttl accepts s/m/h/d/w
+                                        (900, 45m, 2h, 1d, 1d6h30m; default 10m)
 f creds lock                            stop daemon, zeroize key
 f creds status                          locked / unlocked + time left
 f creds set <name> <value>              store a cred
