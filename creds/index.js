@@ -236,6 +236,246 @@ async function op(name, value) {
   return resp;
 }
 
+/** Read all of stdin as a Buffer (for `pack -`). */
+function readStdinBuf() {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    process.stdin.on("data", (c) => chunks.push(Buffer.from(c)));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks)));
+    process.stdin.on("error", reject);
+  });
+}
+
+/** Raw (binary-safe) get: returns a Buffer via the daemon's base64 op. */
+async function getBuf(name, state) {
+  const r = await daemonCall({ op: "get", name, b64: true }, state.socket);
+  if (!r.ok) throw new Error(r.error);
+  return Buffer.from(r.b64 ?? "", "base64");
+}
+
+/** Store raw bytes for a name (one daemon round-trip, no argv/shell/size limits). */
+async function setBuf(name, buf, state) {
+  const r = await daemonCall({ op: "set", name, value: { b64: buf.toString("base64") } }, state.socket);
+  if (!r.ok) throw new Error(r.error);
+}
+
+/** Bulk-write entries in ONE daemon round-trip (daemon stages -> all-or-nothing). */
+async function daemonImport(items, state) {
+  const r = await daemonCall({ op: "import", items }, state.socket);
+  if (!r.ok) throw new Error(r.error);
+  return r.count;
+}
+
+/** Manifest of packed files: { "file:<abs>": meta }. Kept as a normal cred entry. */
+const FILES_KEY = "files";
+
+async function loadIndex(state) {
+  try {
+    const r = await daemonCall({ op: "get", name: FILES_KEY }, state.socket);
+    if (!r.ok || r.value == null || r.value === "") return {};
+    const j = JSON.parse(r.value);
+    return j && typeof j === "object" && !Array.isArray(j) ? j : {};
+  } catch (e) {
+    throw new Error(`manifest '${FILES_KEY}' is unreadable (${e.message}) — refusing to touch it; inspect with: f creds get ${FILES_KEY}`);
+  }
+}
+async function saveIndex(idx, state) {
+  await setBuf(FILES_KEY, Buffer.from(JSON.stringify(idx, null, 2), "utf8"), state);
+}
+
+function expandTilde(p) {
+  return p.startsWith("~") ? path.join(process.env.HOME ?? "", p.slice(1)) : p;
+}
+function looksLikePath(a) {
+  return a.startsWith("/") || a.startsWith("~/") || a.startsWith("./") || a.startsWith("../");
+}
+
+/** Recurse a dir into { file } targets, skipping node_modules/.git. */
+function walk(dir) {
+  const out = [];
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1))) {
+    if (ent.name === "node_modules" || ent.name === ".git") continue;
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) out.push(...walk(p));
+    else if (ent.isFile()) out.push({ file: p });
+  }
+  return out;
+}
+
+/** Expand pack targets: files, '-' = stdin, or '<dir>/...' = every uck dir in <dir>. */
+function expandTargets(rest) {
+  const targets = [];
+  for (const spec of rest) {
+    if (spec === "-") { targets.push({ stdin: true }); continue; }
+    const m = /^(.*?)\/\.\.\.$/.exec(spec);
+    if (m) {
+      const dir = path.resolve(m[1]);
+      if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new Error(`not a directory: ${dir}`);
+      const ucks = fs.readdirSync(dir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && fs.existsSync(path.join(dir, d.name, "index.js")))
+        .map((d) => d.name).sort();
+      if (!ucks.length) throw new Error(`no ucks (dirs with index.js) under ${dir}`);
+      for (const u of ucks) targets.push(...walk(path.join(dir, u)));
+      continue;
+    }
+    const p = path.resolve(spec);
+    if (!fs.existsSync(p)) throw new Error(`no such file: ${spec}`);
+    if (fs.statSync(p).isDirectory()) throw new Error(`${spec} is a directory — use '${spec}/...' for ucks, or name files`);
+    targets.push({ file: p });
+  }
+  return targets;
+}
+
+async function pack(targets, { as, force, dryRun } = {}) {
+  const state = await requireUnlocked();
+  const idx = await loadIndex(state);
+  const items = [];
+  const rows = [];
+  let mode = null;
+
+  const stdinOnly = targets.length === 1 && targets[0].stdin;
+  if (stdinOnly) {
+    const name = as;
+    if (!name) throw new Error("pack - needs --as <name> (stdin has no path)");
+    const buf = await readStdinBuf();
+    items.push({ name, b64: buf.toString("base64") });
+    rows.push({ name, bytes: buf.length });
+  } else {
+    for (const t of targets) {
+      const buf = fs.readFileSync(t.file);
+      if (buf.includes(0) && !force) {
+        throw new Error(`${t.file}: contains NUL (binary) — pass --force to pack it anyway`);
+      }
+      const key = "file:" + t.file;
+      const m = fs.statSync(t.file).mode & 0o777;
+      if (mode === null) mode = m; else if (m !== mode) mode = false;
+      items.push({ name: key, b64: buf.toString("base64") });
+      rows.push({ name: key, bytes: buf.length, replace: key in idx });
+      idx[key] = { bytes: buf.length, mode: m, packed: new Date().toISOString() };
+    }
+  }
+
+  if (dryRun) {
+    for (const r of rows) process.stdout.write(`would pack\t${r.name}\t${r.bytes}${r.replace ? "\t(replaces existing)" : ""}\n`);
+    return;
+  }
+
+  await daemonImport(items, state);            // atomic: all items or none
+  if (!stdinOnly) await saveIndex(idx, state); // manifest after the data
+  for (const r of rows) process.stdout.write(`packed\t${r.name}\t${r.bytes}\n`);
+  if (mode) process.stdout.write(`packed\tmode\t${mode.toString(8)}\n`);
+  process.stdout.write(`ok\t${items.length} item(s)\n`);
+}
+
+/** Build restore specs from argv. Handles `--all`, `<abs>`, `bare`, and
+ *  `<src> => <dst>` (the arrow arrives as its OWN argv token because f's harness
+ *  passes positionals only). Returns { all, specs }. */
+function buildUnpackSpecs(args_) {
+  if (args_.includes("--all")) return { all: true, specs: [] };
+  const specs = [];
+  for (let i = 0; i < args_.length; i++) {
+    const a = args_[i];
+    if (a === "=>" || a === "->") {
+      const prev = specs[specs.length - 1];
+      const dst = args_[++i];
+      if (!prev || !dst) throw new Error(`bad '${a}' mapping (want '<src> ${a} <dst>')`);
+      prev.key = prev.bare ? prev.orig : "file:" + prev.orig;
+      prev.dest = path.resolve(expandTilde(dst));
+      continue;
+    }
+    if (a.includes("=>")) {
+      const j = a.indexOf("=>");
+      const src = a.slice(0, j).trim(), dst = a.slice(j + 2).trim();
+      if (!src || !dst) throw new Error(`bad mapping '${a}' (want '<src> => <dst>')`);
+      specs.push({ key: looksLikePath(src) ? "file:" + path.resolve(expandTilde(src)) : src, dest: path.resolve(expandTilde(dst)) });
+      continue;
+    }
+    if (looksLikePath(a)) {
+      const p = path.resolve(expandTilde(a));
+      specs.push({ key: "file:" + p, dest: p, orig: a });
+      continue;
+    }
+    specs.push({ key: a, dest: path.resolve(a), bare: true, orig: a });
+  }
+  return { all: false, specs };
+}
+
+async function unpack(args_, { force, dir } = {}) {
+  const state = await requireUnlocked();
+  if (args_.includes("--all") && dir && force) {
+    throw new Error("--all --dir --force is refused: --dir is for safe staging — resolve existing files yourself, or map paths explicitly");
+  }
+  let mode = null;
+
+  // raw to stdout: `<name> -`
+  if (args_.includes("-")) {
+    const name = args_.filter((x) => x !== "-")[0];
+    if (!name) throw new Error("unpack - needs <name>");
+    const key = looksLikePath(name) ? "file:" + path.resolve(expandTilde(name)) : name;
+    const buf = await getBuf(key, state);
+    process.stdout.write(buf);
+    process.stderr.write(`f creds: wrote ${buf.length} bytes of '${key}' to stdout\n`);
+    return;
+  }
+
+  const built = buildUnpackSpecs(args_);
+  let specs = built.specs;
+  if (built.all) {
+    const idx = await loadIndex(state);
+    const keys = Object.keys(idx);
+    if (!keys.length) throw new Error(`nothing packed (manifest '${FILES_KEY}' is empty)`);
+    specs = keys.map((k) => {
+      const p = k.startsWith("file:") ? k.slice(5) : null;
+      if (!p || !p.startsWith("/")) throw new Error(`manifest key '${k}' is not a packed absolute path — refusing to guess a destination`);
+      return { key: k, dest: p };
+    });
+    const modes = new Set(keys.map((k) => idx[k]?.mode));
+    if (modes.size === 1) mode = [...modes][0];
+  }
+
+  if (dir) for (const s of specs) s.dest = path.join(dir, s.dest.replace(/^\//, ""));
+
+  const planned = [];
+  for (const s of specs) {
+    const r = await daemonCall({ op: "has", name: s.key, b64: true }, state.socket);
+    if (!r.ok) throw new Error(r.error);
+    if (!r.exists) throw new Error(`no such cred: ${s.key}${s.bare ? " (for a file, pass an absolute path)" : ""}`);
+    planned.push({ ...s, b64: r.b64, exists: fs.existsSync(s.dest) });
+  }
+  for (const p of planned) {
+    if (p.exists && !force) throw new Error(`${p.dest} already exists — pass --force to overwrite (a .bak is written either way once you do)`);
+  }
+  for (const p of planned) {
+    const buf = Buffer.from(p.b64 ?? "", "base64");
+    fs.mkdirSync(path.dirname(p.dest), { recursive: true });
+    if (p.exists) {
+      const bak = `${p.dest}.bak`;
+      fs.copyFileSync(p.dest, bak);
+      process.stdout.write(`backed-up\t${p.dest}\t${bak}\n`);
+    }
+    fs.writeFileSync(p.dest, buf);
+    if (mode != null) fs.chmodSync(p.dest, mode);
+    process.stdout.write(`restored\t${p.key}\t${p.dest}\t${buf.length}\n`);
+  }
+  process.stdout.write(`ok\t${planned.length} file(s)\n`);
+}
+
+/** List the manifest: terse rows, or full JSON with --json. */
+async function filesLs({ json } = {}) {
+  const state = await requireUnlocked();
+  const idx = await loadIndex(state);
+  const keys = Object.keys(idx);
+  if (json) { process.stdout.write(JSON.stringify(idx, null, 2) + "\n"); return; }
+  if (!keys.length) { process.stdout.write("(nothing packed — f creds files pack <path>)\n"); return; }
+  for (const k of keys) {
+    const p = k.startsWith("file:") ? k.slice(5) : k;
+    const e = idx[k] ?? {};
+    const mode = typeof e.mode === "number" ? e.mode.toString(8) : "?";
+    process.stdout.write(`${p}\t${e.bytes ?? "?"}\t${mode}\t${e.packed ?? "?"}\n`);
+  }
+  process.stdout.write(`ok\t${keys.length} file(s)\n`);
+}
+
 function fmt(ms) {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
@@ -372,6 +612,11 @@ export function register(ctx) {
       let ttl = DEFAULT_TTL;
       let timeoutSec = 300; // default wait window for `request`
       let showSecrets = false;
+      let force = false;
+      let dryRun = false;
+      let outDir = null;
+      let asStdin = null;
+      let jsonOut = false;
       const a = [...(args._ ?? [])];
       for (let i = 0; i < a.length; i++) {
         if (a[i] === "--ttl") {
@@ -382,6 +627,18 @@ export function register(ctx) {
           i++;
         } else if (a[i] === "--secrets") {
           showSecrets = true;
+        } else if (a[i] === "--force") {
+          force = true;
+        } else if (a[i] === "--dry-run" || a[i] === "-n") {
+          dryRun = true;
+        } else if (a[i] === "--dir") {
+          outDir = a[++i];
+          i++;
+        } else if (a[i] === "--as") {
+          asStdin = a[++i];
+          i++;
+        } else if (a[i] === "--json") {
+          jsonOut = true;
         } else pos.push(a[i]);
       }
       const redact = (value) =>
@@ -468,6 +725,37 @@ export function register(ctx) {
             for (const n of r.names ?? []) process.stdout.write(n + "\n");
             break;
           }
+          case "files": {
+            const [sub, ...r2] = rest;
+            if (sub === "pack" || !sub) {
+              if (!r2.length) return usage("files pack needs <path>... | '-' | '<dir>/...'");
+              await pack(expandTargets(r2), { as: asStdin, force, dryRun });
+            } else if (sub === "unpack") {
+              if (!r2.length) return usage("files unpack needs <path>... | --all | '<name> -'");
+              await unpack(r2, { force, dir: outDir ? path.resolve(outDir) : null });
+            } else if (sub === "ls") {
+              await filesLs({ json: jsonOut });
+            } else if (sub === "rm") {
+              if (!r2[0]) return usage("files rm needs <path>");
+              const key = "file:" + path.resolve(expandTilde(r2[0]));
+              await op("rm", { name: key });
+              const st = await requireUnlocked();
+              const idx = await loadIndex(st);
+              if (key in idx) { delete idx[key]; await saveIndex(idx, st); }
+              process.stdout.write(`removed\t${key}\n`);
+            } else {
+              return usage(`unknown files subcommand: ${sub}`);
+            }
+            break;
+          }
+          case "pack":
+            if (!rest.length) return usage("pack needs <path>... | '-' | '<dir>/...'");
+            await pack(expandTargets(rest), { as: asStdin, force, dryRun });
+            break;
+          case "unpack":
+            if (!rest.length) return usage("unpack needs <path>... | --all | '<name> -'");
+            await unpack(rest, { force, dir: outDir ? path.resolve(outDir) : null });
+            break;
           case "rm": {
             await op("rm", { name: rest[0] });
             break;
@@ -513,8 +801,21 @@ function usage(msg) {
       "                                    terminals' f fj / ucks that are blocked)\n" +
       "  fill [name]                     prompt + set value(s) for the open\n" +
       "                                    waiters (or just <name>); unblocks them\n" +
-      "  ls                              list names\n" +
-      "  rm <name>                       remove a cred\n"
+      "  ls                              list names (secrets + file:<path> keys + 'files')\n" +
+      "  rm <name>                       remove a cred\n" +
+      "  files <sub>                     packed files (key = file:<abs path> + 'files' manifest)\n" +
+      "    ls [--json]                       list packed files (terse, or raw manifest JSON)\n" +
+      "    pack <path>... [opts]             store files\n" +
+      "        '-'                               value from stdin (needs --as <name>)\n" +
+      "        '<dir>/...'                       every file under each uck dir in <dir>\n" +
+      "        [--as <name>] [--force] [-n]      stdin name / allow binary / dry-run\n" +
+      "    unpack <path>... [opts]           restore to the same abs paths\n" +
+      "        --all                             restore the whole manifest\n" +
+      "        '<src> => <dst>'                  restore to a different path\n" +
+      "        '<name> -'                        raw bytes to stdout\n" +
+      "        [--force] [--dir <root>]          overwrite (w/ .bak) / stage under <root>\n" +
+      "    rm <path>                         remove one packed file + its manifest entry\n" +
+      "  (top-level 'pack'/'unpack' alias 'files pack'/'files unpack')\n"
   );
   process.exit(1);
 }

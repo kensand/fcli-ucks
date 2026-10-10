@@ -44,18 +44,25 @@ function loadCredsBox() {
   const raw = JSON.parse(fs.readFileSync(CREDS, "utf8"));
   return { salt: raw.salt, entries: raw.entries ?? {} };
 }
-function saveCredsBox(box, key) {
+function saveCredsBox(box) {
   // Re-encrypt is per-entry at set time; here we just persist the box as-is.
   fs.writeFileSync(CREDS, JSON.stringify(box, null, 2), { mode: 0o600 });
 }
 
-// Per-value encryption: AES-256-GCM. key is 32 bytes.
-function encValue(key, value) {
+// Per-value encryption: AES-256-GCM over BYTES (so binary round-trips). Values
+// arrive as either a utf8 string (`set`) or { b64 } raw bytes (`setb` / pack).
+// decValue always returns a Buffer; callers decode.
+function encBytes(key, buf) {
   const nonce = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, nonce);
-  const data = Buffer.concat([cipher.update(String(value), "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return { nonce: nonce.toString("base64"), tag: tag.toString("base64"), data: data.toString("base64") };
+  const data = Buffer.concat([cipher.update(buf), cipher.final()]);
+  return { nonce: nonce.toString("base64"), tag: cipher.getAuthTag().toString("base64"), data: data.toString("base64") };
+}
+function encValue(key, value) {
+  if (value && typeof value === "object" && typeof value.b64 === "string") {
+    return encBytes(key, Buffer.from(value.b64, "base64"));
+  }
+  return encBytes(key, Buffer.from(String(value), "utf8"));
 }
 function decValue(key, entry) {
   const decipher = crypto.createDecipheriv(
@@ -64,8 +71,13 @@ function decValue(key, entry) {
     Buffer.from(entry.nonce, "base64")
   );
   decipher.setAuthTag(Buffer.from(entry.tag, "base64"));
-  const plain = Buffer.concat([decipher.update(Buffer.from(entry.data, "base64")), decipher.final()]);
-  return plain.toString("utf8");
+  return Buffer.concat([decipher.update(Buffer.from(entry.data, "base64")), decipher.final()]);
+}
+
+// base64 is a single JSON token, so a raw value can't word-wrap in terminal
+// scrollback into something un-decodable.
+function b64(buf) {
+  return buf.toString("base64");
 }
 
 let key = null;
@@ -91,19 +103,56 @@ const server = net.createServer((socket) => {
         case "get": {
           const e = box.entries[req.name];
           if (!e) resp = { ok: false, error: `no such cred: ${req.name}` };
-          else resp = { ok: true, value: decValue(key, e) };
+          else if (req.b64) resp = { ok: true, b64: b64(decValue(key, e)) };
+          else resp = { ok: true, value: decValue(key, e).toString("utf8") };
           break;
         }
         case "set":
           box.entries[req.name] = encValue(key, req.value);
-          saveCredsBox(box, key);
+          saveCredsBox(box);
           resp = { ok: true };
           break;
+        // Existence + size + (optionally) base64 bytes, without a full get.
+        case "has": {
+          const e = box.entries[req.name];
+          if (!e) resp = { ok: true, exists: false };
+          else {
+            const plain = decValue(key, e);
+            resp = { ok: true, exists: true, bytes: plain.length, b64: req.b64 ? b64(plain) : undefined };
+          }
+          break;
+        }
+        // Bulk write. Each item {name, value}(utf8) or {name, b64}(raw). Stages
+        // every item before touching the box, so one bad item aborts the whole pack.
+        case "import": {
+          const items = Array.isArray(req.items) ? req.items : null;
+          if (!items?.length) resp = { ok: false, error: "import requires items[]" };
+          else {
+            const staged = [];
+            let err = null;
+            for (const it of items) {
+              if (!it || typeof it.name !== "string" || !it.name) { err = "item missing name"; break; }
+              try {
+                staged.push({ name: it.name, entry: encValue(key, it.b64 != null ? { b64: it.b64 } : it.value) });
+              } catch (e) {
+                err = `${it.name}: ${e.message}`;
+                break;
+              }
+            }
+            if (err) resp = { ok: false, error: `import aborted: ${err}` };
+            else {
+              for (const s of staged) box.entries[s.name] = s.entry;
+              saveCredsBox(box);
+              resp = { ok: true, count: staged.length };
+            }
+          }
+          break;
+        }
         case "rm": {
           if (!(req.name in box.entries)) resp = { ok: false, error: `no such cred: ${req.name}` };
           else {
             delete box.entries[req.name];
-            saveCredsBox(box, key);
+            saveCredsBox(box);
             resp = { ok: true };
           }
           break;
@@ -147,9 +196,6 @@ if (!passkey) {
 
 box = loadCredsBox();
 key = deriveKey(passkey, box.salt);
-// Zeroize the passkey string's backing as soon as we can (strings are immutable in JS,
-// but we drop all references immediately).
-// (Note: JS strings can't be truly zeroized; the daemon keeps no further refs.)
 
 server.listen(SOCKET, () => {
   fs.writeFileSync(
