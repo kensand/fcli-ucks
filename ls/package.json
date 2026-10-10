@@ -1,0 +1,5 @@
+{
+  "name": "ls",
+  "type": "module",
+  "private": true
+}
